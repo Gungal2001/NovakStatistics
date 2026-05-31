@@ -1,1 +1,750 @@
-# NovakStatistics
+import numpy as np
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import (
+    ConstantKernel as C,
+    DotProduct,
+    ExpSineSquared,
+    Matern,
+    RBF,
+    RationalQuadratic,
+)
+
+from dash import Dash, Input, Output, State, callback_context, dcc, html
+from dash.exceptions import PreventUpdate
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+# =========================
+# Global settings
+# =========================
+SEED = 43
+X_MIN = 0.0
+X_MAX = 5.0
+GRID_POINTS = 250
+INITIAL_SAMPLE_COUNT = 3
+DEFAULT_MAX_POINTS = 15
+DEFAULT_NOISE_VARIANCE = 1e-9
+
+np.random.seed(SEED)
+
+
+# =========================
+# Ground truth models
+# =========================
+def ground_truth_complex_sin(x):
+    return np.sin(x) + np.sin(3 * x) + 0.5 * np.sin(6 * x) + 2
+
+
+def ground_truth_simple_sin(x):
+    return np.sin(2 * x) + 2
+
+
+def ground_truth_quadratic(x):
+    return -0.5 * (x - 2.5) ** 2 + 3
+
+
+def ground_truth_step(x):
+    return np.where(x < 2.5, 1.5, 3.0)
+
+
+def get_ground_truth(name):
+    models = {
+        "complex_sin": ground_truth_complex_sin,
+        "simple_sin": ground_truth_simple_sin,
+        "quadratic": ground_truth_quadratic,
+        "step": ground_truth_step,
+    }
+    if name not in models:
+        raise ValueError(f"Unknown ground truth: {name}")
+    return models[name]
+
+
+# =========================
+# Kernel helpers
+# =========================
+def create_kernel(name, params):
+    amplitude = params["amplitude"]
+    length_scale = params["length_scale"]
+    period = params["period"]
+    matern_nu = params["matern_nu"]
+    rq_alpha = params["rq_alpha"]
+    linear_sigma_0 = params["linear_sigma_0"]
+    poly_c = params["poly_c"]
+
+    base = C(amplitude)
+    if name == "rbf":
+        return base * RBF(length_scale=length_scale)
+    if name == "matern":
+        return base * Matern(length_scale=length_scale, nu=matern_nu)
+    if name == "periodic":
+        return base * ExpSineSquared(length_scale=length_scale, periodicity=period)
+    if name in ("rq", "rational_quadratic"):
+        return base * RationalQuadratic(length_scale=length_scale, alpha=rq_alpha)
+    if name == "linear":
+        return base * DotProduct(sigma_0=linear_sigma_0)
+    if name in ("poly", "polynomial"):
+        # Sklearn has no direct polynomial kernel in this subset, so we approximate via DotProduct.
+        return base * DotProduct(sigma_0=poly_c)
+    raise ValueError(f"Unknown kernel: {name}")
+
+
+def describe_manual_kernel(strategy, kernel_type, combined_mode, combined_kernels):
+    if strategy == "manual_single":
+        return f"{kernel_type.upper()} Kernel"
+    if strategy == "manual_combined":
+        joiner = "+" if combined_mode == "sum" else "*"
+        return f"Combined ({combined_mode}): {joiner.join(combined_kernels)}"
+    return "Auto-select kernel"
+
+
+def build_manual_kernel(strategy, kernel_type, combined_mode, combined_kernels, params):
+    if strategy == "manual_single":
+        return create_kernel(kernel_type, params), describe_manual_kernel(strategy, kernel_type, combined_mode, combined_kernels)
+
+    if strategy == "manual_combined":
+        kernels = combined_kernels if combined_kernels else [kernel_type]
+        kernel = create_kernel(kernels[0], params)
+        for name in kernels[1:]:
+            other = create_kernel(name, params)
+            if combined_mode == "sum":
+                kernel = kernel + other
+            elif combined_mode == "product":
+                kernel = kernel * other
+            else:
+                raise ValueError(f"Unknown combination mode: {combined_mode}")
+        return kernel, describe_manual_kernel(strategy, kernel_type, combined_mode, kernels)
+
+    return create_kernel(kernel_type, params), "Auto-select kernel"
+
+
+def candidate_kernels(params):
+    rbf = create_kernel("rbf", params)
+    matern = create_kernel("matern", params)
+    periodic = create_kernel("periodic", params)
+    rq = create_kernel("rq", params)
+    return [
+        ("RBF", rbf),
+        ("Matern", matern),
+        ("Periodic", periodic),
+        ("RQ", rq),
+        ("RBF + Periodic", rbf + periodic),
+        ("RBF * Periodic", rbf * periodic),
+    ]
+
+
+def select_best_kernel(X, y, params, noise_variance):
+    best_lml = -np.inf
+    best_kernel = None
+    best_label = None
+    best_gp = None
+
+    for label, kernel in candidate_kernels(params):
+        gp = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=max(noise_variance, 1e-9),
+            n_restarts_optimizer=3,
+            normalize_y=False,
+        )
+        try:
+            gp.fit(X, y)
+            lml = gp.log_marginal_likelihood_value_
+            if np.isfinite(lml) and lml > best_lml:
+                best_lml = lml
+                best_kernel = kernel
+                best_label = label
+                best_gp = gp
+        except Exception:
+            continue
+
+    if best_gp is None:
+        fallback_kernel = create_kernel("rbf", params)
+        best_gp = GaussianProcessRegressor(
+            kernel=fallback_kernel,
+            alpha=max(noise_variance, 1e-9),
+            n_restarts_optimizer=3,
+            normalize_y=False,
+        )
+        best_gp.fit(X, y)
+        best_kernel = fallback_kernel
+        best_label = "RBF (fallback)"
+
+    return best_gp, best_kernel, best_label
+
+
+# =========================
+# Acquisition functions
+# =========================
+def expected_improvement(x, gp, y_best, xi):
+    mu, sigma = gp.predict(x, return_std=True)
+    mu = np.asarray(mu).reshape(-1)
+    sigma = np.asarray(sigma).reshape(-1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        imp = mu - y_best - xi
+        z = np.zeros_like(mu)
+        valid = sigma > 0.0
+        z[valid] = imp[valid] / sigma[valid]
+        ei = np.zeros_like(mu)
+        ei[valid] = imp[valid] * norm.cdf(z[valid]) + sigma[valid] * norm.pdf(z[valid])
+    return ei
+
+
+def probability_of_improvement(x, gp, y_best, xi):
+    mu, sigma = gp.predict(x, return_std=True)
+    mu = np.asarray(mu).reshape(-1)
+    sigma = np.asarray(sigma).reshape(-1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.zeros_like(mu)
+        valid = sigma > 0.0
+        z[valid] = (mu[valid] - y_best - xi) / sigma[valid]
+        pi = np.zeros_like(mu)
+        pi[valid] = norm.cdf(z[valid])
+    return pi
+
+
+def upper_confidence_bound(x, gp, kappa):
+    mu, sigma = gp.predict(x, return_std=True)
+    return mu.reshape(-1) + kappa * sigma.reshape(-1)
+
+
+def compute_acquisition(x, gp, y_best, method, xi, kappa):
+    method = method.lower()
+    if method == "ei":
+        return expected_improvement(x, gp, y_best, xi), f"EI (xi={xi})"
+    if method == "pi":
+        return probability_of_improvement(x, gp, y_best, xi), f"PI (xi={xi})"
+    if method == "ucb":
+        return upper_confidence_bound(x, gp, kappa), f"UCB (kappa={kappa})"
+    raise ValueError(f"Unknown acquisition method: {method}")
+
+
+# =========================
+# GP helpers
+# =========================
+def make_training_arrays(points):
+    xs = np.array(points.get("xs", []), dtype=float)
+    ys = np.array(points.get("ys", []), dtype=float)
+    if xs.size == 0:
+        return np.empty((0, 1)), np.empty((0,))
+    return xs.reshape(-1, 1), ys.reshape(-1)
+
+
+def suggest_next_point(acquisition, x_grid, x_used):
+    score = np.asarray(acquisition).copy()
+    for x in x_used:
+        idx = int(np.argmin(np.abs(x_grid[:, 0] - x)))
+        score[idx] = -np.inf
+    best_idx = int(np.argmax(score))
+    if not np.isfinite(score[best_idx]):
+        return None
+    return float(x_grid[best_idx, 0])
+
+
+class PriorPredictor:
+    def __init__(self, mu, sigma):
+        self.mu = np.asarray(mu).reshape(-1)
+        self.sigma = np.asarray(sigma).reshape(-1)
+
+    def predict(self, x, return_std=True):
+        if return_std:
+            return self.mu, self.sigma
+        return self.mu
+
+
+def fit_model(points, controls, x_grid):
+    params = {
+        "amplitude": controls["kernel_amplitude"],
+        "length_scale": controls["length_scale"],
+        "period": controls["period"],
+        "matern_nu": controls["matern_nu"],
+        "rq_alpha": controls["rq_alpha"],
+        "linear_sigma_0": controls["linear_sigma_0"],
+        "poly_c": controls["poly_c"],
+    }
+    X_train, y_train = make_training_arrays(points)
+    strategy = controls["kernel_strategy"]
+    noise_variance = controls["noise_variance"]
+    kernel_type = controls["kernel_type"]
+    combined_mode = controls["combined_mode"]
+    combined_kernels = controls["combined_kernels"]
+    auto_select = strategy == "auto_select"
+
+    kernel, kernel_label = build_manual_kernel(strategy, kernel_type, combined_mode, combined_kernels, params)
+
+    if X_train.shape[0] == 0:
+        mu = np.zeros(x_grid.shape[0])
+        cov = kernel(x_grid)
+        sigma = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        return {
+            "gp": None,
+            "kernel": kernel,
+            "kernel_label": kernel_label,
+            "mu": mu,
+            "sigma": sigma,
+            "cov": cov,
+            "X_train": X_train,
+            "y_train": y_train,
+            "auto_selected": False,
+        }
+
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=max(noise_variance, 1e-9),
+        n_restarts_optimizer=5,
+        normalize_y=False,
+    )
+    gp.fit(X_train, y_train)
+
+    if auto_select and X_train.shape[0] >= 2:
+        gp, selected_kernel, selected_label = select_best_kernel(X_train, y_train, params, noise_variance)
+        kernel = selected_kernel
+        kernel_label = selected_label
+
+    mu, cov = gp.predict(x_grid, return_cov=True)
+    mu = np.asarray(mu).reshape(-1)
+    sigma = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+
+    return {
+        "gp": gp,
+        "kernel": kernel,
+        "kernel_label": kernel_label,
+        "mu": mu,
+        "sigma": sigma,
+        "cov": cov,
+        "X_train": X_train,
+        "y_train": y_train,
+        "auto_selected": auto_select and X_train.shape[0] >= 2,
+    }
+
+
+def sample_functions(model_info, x_grid, n_samples, seed):
+    rng = np.random.default_rng(seed)
+    gp = model_info["gp"]
+    cov = model_info["cov"]
+    mu = model_info["mu"]
+    jitter = 1e-9 * np.eye(cov.shape[0])
+    if gp is None:
+        samples = rng.multivariate_normal(mu, cov + jitter, size=n_samples).T
+    else:
+        samples = gp.sample_y(x_grid, n_samples=n_samples, random_state=seed)
+    return np.asarray(samples)
+
+
+# =========================
+# Plot builders
+# =========================
+def make_gp_figure(x_grid, y_true, model_info, points, next_x):
+    X_train, y_train = model_info["X_train"], model_info["y_train"]
+    mu, sigma = model_info["mu"], model_info["sigma"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_grid[:, 0], y=y_true, mode="lines", name="Ground Truth", line=dict(color="rgba(80,80,80,0.7)", dash="dash")))
+    fig.add_trace(go.Scatter(x=x_grid[:, 0], y=mu, mode="lines", name="GP Mean", line=dict(color="#1f77b4", width=3)))
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([x_grid[:, 0], x_grid[::-1, 0]]),
+        y=np.concatenate([mu - 1.96 * sigma, (mu + 1.96 * sigma)[::-1]]),
+        fill="toself",
+        fillcolor="rgba(31, 119, 180, 0.18)",
+        line=dict(color="rgba(255,255,255,0)"),
+        name="95% CI",
+        hoverinfo="skip",
+        showlegend=True,
+    ))
+    if X_train.shape[0] > 0:
+        fig.add_trace(go.Scatter(
+            x=X_train[:, 0], y=y_train,
+            mode="markers",
+            name="Measured Points",
+            marker=dict(color="red", size=10, line=dict(color="darkred", width=1)),
+        ))
+    if next_x is not None:
+        fig.add_vline(x=next_x, line_width=2, line_dash="dot", line_color="orange")
+
+    fig.update_layout(
+        template="plotly_white",
+        title="Gaussian Process Modeling (click this chart to add a point)",
+        xaxis_title="Distance / x",
+        yaxis_title="Value",
+        margin=dict(l=20, r=20, t=55, b=20),
+        height=430,
+    )
+    fig.update_xaxes(range=[X_MIN, X_MAX])
+    return fig
+
+
+def make_samples_figure(x_grid, y_true, model_info, n_samples, seed):
+    samples = sample_functions(model_info, x_grid, n_samples=n_samples, seed=seed)
+    X_train, y_train = model_info["X_train"], model_info["y_train"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_grid[:, 0], y=y_true, mode="lines", name="Ground Truth", line=dict(color="rgba(80,80,80,0.6)", dash="dash")))
+    colors = ["#0b84a5", "#e45756", "#2a9d8f", "#f4a261", "#6a4c93"]
+    for i in range(samples.shape[1]):
+        fig.add_trace(go.Scatter(
+            x=x_grid[:, 0],
+            y=samples[:, i],
+            mode="lines",
+            name=f"Sample {i + 1}",
+            line=dict(color=colors[i % len(colors)], width=1.8),
+            opacity=0.8,
+        ))
+    if X_train.shape[0] > 0:
+        fig.add_trace(go.Scatter(x=X_train[:, 0], y=y_train, mode="markers", name="Measured Points", marker=dict(color="red", size=9)))
+    fig.update_layout(
+        template="plotly_white",
+        title="Posterior / Prior Samples",
+        xaxis_title="Distance / x",
+        yaxis_title="Value",
+        margin=dict(l=20, r=20, t=55, b=20),
+        height=430,
+    )
+    fig.update_xaxes(range=[X_MIN, X_MAX])
+    return fig
+
+
+def make_acq_figure(x_grid, acquisition, acquisition_label, next_x):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_grid[:, 0], y=acquisition, mode="lines", name=acquisition_label, line=dict(color="green", width=3)))
+    fig.add_trace(go.Scatter(x=x_grid[:, 0], y=np.zeros_like(x_grid[:, 0]), mode="lines", line=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(
+        x=x_grid[:, 0],
+        y=acquisition,
+        fill="tozeroy",
+        fillcolor="rgba(0, 128, 0, 0.22)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Acquisition area",
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    if next_x is not None:
+        fig.add_vline(x=next_x, line_width=2, line_dash="dash", line_color="orange")
+    fig.update_layout(
+        template="plotly_white",
+        title="Acquisition Function",
+        xaxis_title="Distance / x",
+        yaxis_title="Value",
+        margin=dict(l=20, r=20, t=55, b=20),
+        height=320,
+    )
+    fig.update_xaxes(range=[X_MIN, X_MAX])
+    return fig
+
+
+def make_cov_figure(x_grid, cov, kernel_label):
+    x_vals = x_grid[:, 0]
+    fig = go.Figure(data=go.Heatmap(x=x_vals, y=x_vals, z=cov, colorscale="Viridis", colorbar=dict(title="Covariance")))
+    fig.update_layout(
+        template="plotly_white",
+        title=f"Covariance Matrix - {kernel_label}",
+        xaxis_title="Distance / x",
+        yaxis_title="Distance / x",
+        margin=dict(l=20, r=20, t=55, b=20),
+        height=320,
+    )
+    return fig
+
+
+# =========================
+# Dash app
+# =========================
+app = Dash(__name__)
+app.title = "Interactive Bayesian Optimization"
+
+app.layout = html.Div(
+    [
+        dcc.Store(id="point-store", data={"xs": [], "ys": []}),
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.H2("Interactive BO App", style={"marginTop": "0px"}),
+                        html.Div(
+                            "Click in the GP plot to add measurement points. The app updates the GP, acquisition, samples and covariance matrix automatically.",
+                            style={"marginBottom": "16px", "lineHeight": "1.4"},
+                        ),
+                        html.Label("Ground truth model"),
+                        dcc.Dropdown(
+                            id="gt-model",
+                            value="complex_sin",
+                            clearable=False,
+                            options=[
+                                {"label": "Complex sine (gold-mine style)", "value": "complex_sin"},
+                                {"label": "Simple sine", "value": "simple_sin"},
+                                {"label": "Quadratic", "value": "quadratic"},
+                                {"label": "Step", "value": "step"},
+                            ],
+                        ),
+                        html.Br(),
+                        html.Label("Kernel strategy"),
+                        dcc.RadioItems(
+                            id="kernel-strategy",
+                            value="manual_single",
+                            options=[
+                                {"label": "Manual single kernel", "value": "manual_single"},
+                                {"label": "Manual combined kernels", "value": "manual_combined"},
+                                {"label": "Auto-select best kernel", "value": "auto_select"},
+                            ],
+                            style={"display": "grid", "gap": "6px"},
+                        ),
+                        html.Br(),
+                        html.Label("Single kernel"),
+                        dcc.Dropdown(
+                            id="kernel-type",
+                            value="matern",
+                            clearable=False,
+                            options=[
+                                {"label": "RBF", "value": "rbf"},
+                                {"label": "Matern", "value": "matern"},
+                                {"label": "Periodic", "value": "periodic"},
+                                {"label": "Rational Quadratic", "value": "rq"},
+                                {"label": "Linear", "value": "linear"},
+                            ],
+                        ),
+                        html.Br(),
+                        html.Label("Combined kernels"),
+                        dcc.Dropdown(
+                            id="combined-kernels",
+                            value=["linear", "rbf"],
+                            multi=True,
+                            clearable=False,
+                            options=[
+                                {"label": "Linear", "value": "linear"},
+                                {"label": "RBF", "value": "rbf"},
+                                {"label": "Periodic", "value": "periodic"},
+                                {"label": "Matern", "value": "matern"},
+                                {"label": "Rational Quadratic", "value": "rq"},
+                            ],
+                        ),
+                        html.Br(),
+                        html.Label("Combination mode"),
+                        dcc.RadioItems(
+                            id="combined-mode",
+                            value="sum",
+                            options=[
+                                {"label": "+ sum", "value": "sum"},
+                                {"label": "* product", "value": "product"},
+                            ],
+                            style={"display": "flex", "gap": "20px"},
+                        ),
+                        html.Hr(),
+                        html.Label("Acquisition method"),
+                        dcc.Dropdown(
+                            id="acq-method",
+                            value="ucb",
+                            clearable=False,
+                            options=[
+                                {"label": "Expected Improvement (EI)", "value": "ei"},
+                                {"label": "Probability of Improvement (PI)", "value": "pi"},
+                                {"label": "Upper Confidence Bound (UCB)", "value": "ucb"},
+                            ],
+                        ),
+                        html.Br(),
+                        html.Label("xi for EI / PI"),
+                        dcc.Slider(id="xi", min=0.0, max=1.0, step=0.01, value=0.01, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("kappa for UCB"),
+                        dcc.Slider(id="kappa", min=0.1, max=5.0, step=0.1, value=2.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Kernel length scale"),
+                        dcc.Slider(id="length-scale", min=0.1, max=5.0, step=0.1, value=0.5, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Periodic period"),
+                        dcc.Slider(id="period", min=1.0, max=10.0, step=0.5, value=5.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Matern nu"),
+                        dcc.Slider(id="matern-nu", min=0.5, max=2.5, step=0.5, value=1.5, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("RQ alpha"),
+                        dcc.Slider(id="rq-alpha", min=0.1, max=5.0, step=0.1, value=1.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Linear sigma_0"),
+                        dcc.Slider(id="linear-sigma-0", min=0.1, max=5.0, step=0.1, value=1.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Kernel amplitude"),
+                        dcc.Slider(id="kernel-amplitude", min=0.1, max=5.0, step=0.1, value=1.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Polynomial c"),
+                        dcc.Slider(id="poly-c", min=0.1, max=5.0, step=0.1, value=1.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Hr(),
+                        html.Label("Max points"),
+                        dcc.Slider(id="max-points", min=1, max=40, step=1, value=DEFAULT_MAX_POINTS, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Measurement noise variance"),
+                        dcc.Slider(id="noise-variance", min=0.0, max=0.5, step=0.001, value=0.0, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Label("Posterior samples shown"),
+                        dcc.Slider(id="sample-count", min=1, max=10, step=1, value=3, tooltip={"placement": "bottom", "always_visible": True}),
+                        html.Br(),
+                        html.Button("Clear measurements", id="clear-btn", n_clicks=0, style={"width": "100%", "padding": "10px"}),
+                    ],
+                    style={
+                        "width": "340px",
+                        "minWidth": "340px",
+                        "padding": "20px",
+                        "borderRight": "1px solid #ddd",
+                        "background": "#f8f9fb",
+                        "height": "100vh",
+                        "overflowY": "auto",
+                        "boxSizing": "border-box",
+                    },
+                ),
+                html.Div(
+                    [
+                        html.Div(id="summary-box", style={"marginBottom": "14px", "padding": "12px", "border": "1px solid #ddd", "borderRadius": "10px", "background": "white"}),
+                        dcc.Graph(id="gp-graph", config={"displayModeBar": True}),
+                        html.Div(
+                            [
+                                dcc.Graph(id="samples-graph", style={"flex": "1"}),
+                                dcc.Graph(id="acq-graph", style={"flex": "1"}),
+                            ],
+                            style={"display": "flex", "gap": "12px"},
+                        ),
+                        dcc.Graph(id="cov-graph"),
+                    ],
+                    style={"flex": "1", "padding": "18px", "background": "#ffffff"},
+                ),
+            ],
+            style={"display": "flex", "fontFamily": "Arial, sans-serif"},
+        ),
+    ]
+)
+
+
+@app.callback(
+    Output("point-store", "data"),
+    Input("gp-graph", "clickData"),
+    Input("clear-btn", "n_clicks"),
+    State("point-store", "data"),
+    State("max-points", "value"),
+    State("gt-model", "value"),
+    prevent_initial_call=True,
+)
+def update_points(click_data, clear_clicks, store, max_points, gt_model):
+    trigger = callback_context.triggered_id
+    store = store or {"xs": [], "ys": []}
+    if trigger == "clear-btn":
+        return {"xs": [], "ys": []}
+
+    if trigger != "gp-graph" or not click_data:
+        raise PreventUpdate
+
+    if len(store["xs"]) >= int(max_points):
+        return store
+
+    point = click_data["points"][0]
+    x_clicked = float(point["x"])
+    x_clicked = round(x_clicked, 4)
+    if any(np.isclose(x_clicked, old_x, atol=1e-6) for old_x in store["xs"]):
+        return store
+
+    y_true = get_ground_truth(gt_model)(np.array([x_clicked]))[0]
+    store["xs"].append(x_clicked)
+    store["ys"].append(float(y_true))
+    return store
+
+
+@app.callback(
+    Output("gp-graph", "figure"),
+    Output("samples-graph", "figure"),
+    Output("acq-graph", "figure"),
+    Output("cov-graph", "figure"),
+    Output("summary-box", "children"),
+    Input("point-store", "data"),
+    Input("gt-model", "value"),
+    Input("kernel-strategy", "value"),
+    Input("kernel-type", "value"),
+    Input("combined-kernels", "value"),
+    Input("combined-mode", "value"),
+    Input("acq-method", "value"),
+    Input("xi", "value"),
+    Input("kappa", "value"),
+    Input("length-scale", "value"),
+    Input("period", "value"),
+    Input("matern-nu", "value"),
+    Input("rq-alpha", "value"),
+    Input("linear-sigma-0", "value"),
+    Input("kernel-amplitude", "value"),
+    Input("poly-c", "value"),
+    Input("max-points", "value"),
+    Input("noise-variance", "value"),
+    Input("sample-count", "value"),
+)
+def render_dashboard(
+    store,
+    gt_model,
+    kernel_strategy,
+    kernel_type,
+    combined_kernels,
+    combined_mode,
+    acq_method,
+    xi,
+    kappa,
+    length_scale,
+    period,
+    matern_nu,
+    rq_alpha,
+    linear_sigma_0,
+    kernel_amplitude,
+    poly_c,
+    max_points,
+    noise_variance,
+    sample_count,
+):
+    x_grid = np.linspace(X_MIN, X_MAX, GRID_POINTS).reshape(-1, 1)
+    gt_func = get_ground_truth(gt_model)
+    y_true = gt_func(x_grid).reshape(-1)
+
+    controls = {
+        "kernel_strategy": kernel_strategy,
+        "kernel_type": kernel_type,
+        "combined_mode": combined_mode,
+        "combined_kernels": combined_kernels or [kernel_type],
+        "noise_variance": noise_variance,
+        "length_scale": length_scale,
+        "period": period,
+        "matern_nu": matern_nu,
+        "rq_alpha": rq_alpha,
+        "linear_sigma_0": linear_sigma_0,
+        "kernel_amplitude": kernel_amplitude,
+        "poly_c": poly_c,
+    }
+
+    points = store or {"xs": [], "ys": []}
+    X_train, y_train = make_training_arrays(points)
+    model_info = fit_model(points, controls, x_grid)
+
+    y_best = float(np.max(y_train)) if y_train.size > 0 else 0.0
+    if model_info["gp"] is None:
+        acquisition_model = PriorPredictor(model_info["mu"], model_info["sigma"])
+    else:
+        acquisition_model = model_info["gp"]
+    acquisition, acquisition_label = compute_acquisition(x_grid, acquisition_model, y_best, acq_method, xi, kappa)
+
+    next_x = suggest_next_point(acquisition, x_grid, X_train[:, 0] if X_train.shape[0] > 0 else [])
+    if X_train.shape[0] >= int(max_points):
+        next_x = None
+
+    gp_figure = make_gp_figure(x_grid, y_true, model_info, points, next_x)
+    samples_figure = make_samples_figure(x_grid, y_true, model_info, n_samples=int(sample_count), seed=SEED + X_train.shape[0])
+    acq_figure = make_acq_figure(x_grid, acquisition, acquisition_label, next_x)
+    cov_figure = make_cov_figure(x_grid, model_info["cov"], model_info["kernel_label"])
+
+    status_lines = [
+        html.B("Current configuration"),
+        html.Div(f"Ground truth: {gt_model}"),
+        html.Div(f"Kernel: {model_info['kernel_label']}") ,
+        html.Div(f"Acquisition: {acq_method.upper()} (xi={xi}, kappa={kappa})"),
+        html.Div(f"Measured points: {len(points['xs'])} / {max_points}"),
+    ]
+    if next_x is not None:
+        status_lines.append(html.Div(f"Suggested next x: {next_x:.4f}"))
+    else:
+        status_lines.append(html.Div("Maximum number of points reached or no valid next point left."))
+
+    return gp_figure, samples_figure, acq_figure, cov_figure, status_lines
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
