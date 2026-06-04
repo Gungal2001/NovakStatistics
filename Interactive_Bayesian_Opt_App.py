@@ -1152,6 +1152,13 @@ def update_null_model(c_val, obs_effect, prior_sd, post_sd):
         line=dict(color="rgba(255,255,255,0)"), name="Posterior Area", hoverinfo="skip"
     ))
 
+    # Dummy trace damit die rote Linie in der Legende auftaucht
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="lines",
+        line=dict(color="red", dash="dash"),
+        name="H0 Interval (±c)"
+    ))
+
     fig.add_vline(x=c_val, line=dict(color="red", dash="dash"))
     fig.add_vline(x=-c_val, line=dict(color="red", dash="dash"))
 
