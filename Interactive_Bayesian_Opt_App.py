@@ -554,14 +554,12 @@ app.title = "Interactive Bayesian Optimization"
 app.layout = html.Div(
     [
         dcc.Store(id="point-store", data={"xs": [], "ys": []}),
-        html.Div(
-            [
-                html.Div(id="bo-controls", children=[
-                    html.H2("Interactive BO App", style={"marginTop": "0px"}),
-                    html.Div(
-                        "Click in the GP plot to add measurement points.",
-                        style={"marginBottom": "16px", "lineHeight": "1.4"},
-                    ),
+        # ... dein ganzer Inhalt ...
+        html.Div(id="bo-view", children=[...]), 
+        html.Div(id="two-d-view", children=[...], style={"display": "none"})
+    ],
+    style={"display": "flex", "fontFamily": "Arial, sans-serif"},
+),
                     html.Label("Ground truth model"),
                     dcc.Dropdown(
                         id="gt-model",
