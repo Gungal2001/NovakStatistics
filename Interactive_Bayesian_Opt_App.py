@@ -10,7 +10,7 @@ from sklearn.gaussian_process.kernels import (
     RationalQuadratic,
 )
 
-from dash import Dash, Input, Output, State, callback_context, dcc, html
+from dash import Dash, Input, Output, State, ctx, dcc, html
 from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -549,17 +549,21 @@ def make_2d_gaussian_figure(mu1, mu2, var1, var2, cov_val, cond_on="None", cond_
 # Dash app
 # =========================
 app = Dash(__name__, suppress_callback_exceptions=True)
+# Diese Zeile ist das, was Render/Gunicorn braucht:
+server = app.server
 app.title = "Interactive Bayesian Optimization"
 
 app.layout = html.Div(
     [
         dcc.Store(id="point-store", data={"xs": [], "ys": []}),
-        # ... dein ganzer Inhalt ...
-        html.Div(id="bo-view", children=[...]), 
-        html.Div(id="two-d-view", children=[...], style={"display": "none"})
-    ],
-    style={"display": "flex", "fontFamily": "Arial, sans-serif"},
-),
+        html.Div(
+            [
+                html.Div(id="bo-controls", children=[
+                    html.H2("Interactive BO App", style={"marginTop": "0px"}),
+                    html.Div(
+                        "Click in the GP plot to add measurement points.",
+                        style={"marginBottom": "16px", "lineHeight": "1.4"},
+                    ),
                     html.Label("Ground truth model"),
                     dcc.Dropdown(
                         id="gt-model",
@@ -797,7 +801,7 @@ app.layout = html.Div(
     prevent_initial_call=True,
 )
 def update_points(click_data, clear_clicks, store, max_points, gt_model):
-    trigger = callback_context.triggered_id
+    trigger = ctx.triggered_id
     store = store or {"xs": [], "ys": []}
     if trigger == "clear-btn":
         return {"xs": [], "ys": []}
@@ -938,6 +942,9 @@ def render_dashboard(
     Input("tabs", "value")
 )
 def switch_tabs(tab):
+    if tab is None:
+        tab = "tab-all"
+        
     # Base hidden style using display: none
     hidden = {"display": "none"}
     
@@ -1081,14 +1088,5 @@ def update_2d_gaussian(mu1, mu2, var1, var2, cov12, cond_on, cond_val):
     return make_2d_gaussian_figure(mu1, mu2, var1, var2, cov12, cond_on, cond_val)
 
 
-# ... dein ganzer Code mit den Callbacks etc. ...
-
-app = Dash(__name__, suppress_callback_exceptions=True)
-# Diese Zeile ist das, was Render/Gunicorn braucht:
-server = app.server 
-
-# ... dein Layout ...
-
-# Das hier ist nur für deinen Laptop:
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=8052)
