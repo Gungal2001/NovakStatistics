@@ -1083,5 +1083,14 @@ def update_2d_gaussian(mu1, mu2, var1, var2, cov12, cond_on, cond_val):
     return make_2d_gaussian_figure(mu1, mu2, var1, var2, cov12, cond_on, cond_val)
 
 
+# ... dein ganzer Code mit den Callbacks etc. ...
+
+app = Dash(__name__, suppress_callback_exceptions=True)
+# Diese Zeile ist das, was Render/Gunicorn braucht:
+server = app.server 
+
+# ... dein Layout ...
+
+# Das hier ist nur für deinen Laptop:
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=8052)
