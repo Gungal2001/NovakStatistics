@@ -750,6 +750,20 @@ app.layout = html.Div(
                         dcc.Slider(id="condition-val", min=-5.0, max=5.0, step=0.1, value=0.0, tooltip={"placement": "bottom", "always_visible": True}),
                     ], style={"display": "none"}),
                 ], style={"display": "none"}),
+                html.Div(id="null-model-controls", children=[
+                    html.H2("Bayesian Interval Null Model", style={"marginTop": "0px"}),
+                    html.Label("H0 Interval (c)"),
+                    dcc.Slider(id="c-val", min=0.05, max=1.0, step=0.05, value=0.2, tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Br(),
+                    html.Label("Observed Effect/Mean"),
+                    dcc.Slider(id="obs-effect", min=-3.0, max=3.0, step=0.1, value=0.8, tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Br(),
+                    html.Label("Prior Width (Std Dev)"),
+                    dcc.Slider(id="prior-sd", min=0.5, max=3.0, step=0.1, value=1.2, tooltip={"placement": "bottom", "always_visible": True}),
+                    html.Br(),
+                    html.Label("Posterior Width (Std Dev)"),
+                    dcc.Slider(id="post-sd", min=0.1, max=1.5, step=0.1, value=0.4, tooltip={"placement": "bottom", "always_visible": True}),
+                ], style={"display": "none"}),
             ],
             style={
                 "width": "340px",
@@ -769,6 +783,7 @@ app.layout = html.Div(
                     dcc.Tab(label="Acquisition", value="tab-acq"),
                     dcc.Tab(label="All Together", value="tab-all"),
                     dcc.Tab(label="2D Cov Matrix", value="tab-2d"),
+                    dcc.Tab(label="Null Model", value="tab-null"),
                 ]),
                 html.Div(id="bo-view", children=[
                     html.Div(id="summary-box", style={"marginBottom": "14px", "padding": "12px", "border": "1px solid #ddd", "borderRadius": "10px", "background": "white"}),
@@ -782,7 +797,12 @@ app.layout = html.Div(
                 
                 html.Div(id="two-d-view", children=[
                     dcc.Graph(id="2d-graph", style={"height": "80vh"})
-                ], style={"display": "none", "paddingTop": "15px"})
+                ], style={"display": "none", "paddingTop": "15px"}),
+                
+                html.Div(id="null-model-view", children=[
+                    dcc.Graph(id="null-model-graph"),
+                    html.Div(id="null-model-text", style={"marginTop": "20px", "fontSize": "16px", "padding": "20px", "background": "#f8f9fb", "borderRadius": "8px"})
+                ], style={"display": "none", "paddingTop": "15px", "width": "100%"})
             ],
             style={"flex": "1", "padding": "18px", "background": "#ffffff"},
         ),
@@ -928,8 +948,10 @@ def render_dashboard(
 @app.callback(
     Output("bo-controls", "style"),
     Output("two-d-controls", "style"),
+    Output("null-model-controls", "style"),
     Output("bo-view", "style"),
     Output("two-d-view", "style"),
+    Output("null-model-view", "style"),
     Output("summary-box", "style"),
     Output("gp-container", "style"),
     Output("flex-container", "style"),
@@ -950,8 +972,10 @@ def switch_tabs(tab):
     
     bo_ctrl = hidden.copy()
     two_d_ctrl = hidden.copy()
+    null_ctrl = hidden.copy()
     bo_view = hidden.copy()
     two_d_view = hidden.copy()
+    null_view = hidden.copy()
     
     summary = hidden.copy()
     gp = hidden.copy()
@@ -967,6 +991,9 @@ def switch_tabs(tab):
     if tab == "tab-2d":
         two_d_ctrl = {"display": "block"}
         two_d_view = {"display": "block", "paddingTop": "15px", "width": "100%"}
+    elif tab == "tab-null":
+        null_ctrl = {"display": "block"}
+        null_view = {"display": "block", "paddingTop": "15px", "width": "100%"}
     else:
         bo_ctrl = {"display": "block"}
         bo_view = {"display": "flex", "flexDirection": "column", "gap": "15px", "paddingTop": "15px", "width": "100%"}
@@ -997,7 +1024,7 @@ def switch_tabs(tab):
             sample_controls = {"display": "block", "marginTop": "20px"}
             kernel_controls = {"display": "block"}
             
-    return bo_ctrl, two_d_ctrl, bo_view, two_d_view, summary, gp, flex, samples, acq, cov, acq_controls, sample_controls, kernel_controls
+    return bo_ctrl, two_d_ctrl, null_ctrl, bo_view, two_d_view, null_view, summary, gp, flex, samples, acq, cov, acq_controls, sample_controls, kernel_controls
 
 
 @app.callback(
@@ -1086,6 +1113,68 @@ def toggle_cond_val(cond_var):
 )
 def update_2d_gaussian(mu1, mu2, var1, var2, cov12, cond_on, cond_val):
     return make_2d_gaussian_figure(mu1, mu2, var1, var2, cov12, cond_on, cond_val)
+
+
+@app.callback(
+    Output("null-model-graph", "figure"),
+    Output("null-model-text", "children"),
+    Input("c-val", "value"),
+    Input("obs-effect", "value"),
+    Input("prior-sd", "value"),
+    Input("post-sd", "value")
+)
+def update_null_model(c_val, obs_effect, prior_sd, post_sd):
+    x = np.linspace(-4, 4, 1000)
+    prior_density = norm.pdf(x, 0, prior_sd)
+    posterior_density = norm.pdf(x, obs_effect, post_sd)
+
+    area_prior = norm.cdf(c_val, 0, prior_sd) - norm.cdf(-c_val, 0, prior_sd)
+    area_post = norm.cdf(c_val, obs_effect, post_sd) - norm.cdf(-c_val, obs_effect, post_sd)
+    bf_01 = area_post / area_prior if area_prior > 0 else np.inf
+
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(x=x, y=prior_density, name="Prior", line=dict(color="gray", width=3)))
+    fig.add_trace(go.Scatter(x=x, y=posterior_density, name="Posterior", line=dict(color="blue", width=3)))
+
+    x_fill = np.linspace(-c_val, c_val, 100)
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([x_fill, x_fill[::-1]]),
+        y=np.concatenate([norm.pdf(x_fill, 0, prior_sd), np.zeros_like(x_fill)]),
+        fill="toself", fillcolor="rgba(128,128,128,0.3)",
+        line=dict(color="rgba(255,255,255,0)"), name="Prior Area", hoverinfo="skip"
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([x_fill, x_fill[::-1]]),
+        y=np.concatenate([norm.pdf(x_fill, obs_effect, post_sd), np.zeros_like(x_fill)]),
+        fill="toself", fillcolor="rgba(0,0,255,0.3)",
+        line=dict(color="rgba(255,255,255,0)"), name="Posterior Area", hoverinfo="skip"
+    ))
+
+    fig.add_vline(x=c_val, line=dict(color="red", dash="dash"))
+    fig.add_vline(x=-c_val, line=dict(color="red", dash="dash"))
+
+    fig.update_layout(
+        title="Probability Mass in the Null Interval",
+        xaxis_title="Effect Size (Delta)",
+        yaxis_title="Density",
+        template="plotly_white",
+        height=500,
+        margin=dict(l=20, r=20, t=55, b=20),
+        font=dict(size=14)
+    )
+
+    interpretation = "supports the null interval" if bf_01 > 1 else "speaks AGAINST the null interval"
+    
+    text_out = html.Div([
+        html.Div(f"Area in Null Interval BEFORE (Prior): {area_prior*100:.2f} %", style={"marginBottom": "10px"}),
+        html.Div(f"Area in Null Interval AFTER (Posterior): {area_post*100:.2f} %", style={"marginBottom": "10px"}),
+        html.H3(f"Interval Bayes Factor (BF_01): {bf_01:.4f}", style={"color": "#2c3e50"}),
+        html.Div(f"-> Data {interpretation}", style={"fontWeight": "bold", "color": "green" if bf_01 > 1 else "red"})
+    ])
+
+    return fig, text_out
 
 
 if __name__ == "__main__":
